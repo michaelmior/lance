@@ -51,6 +51,9 @@ message Manifest {
   repeated Field fields = 1;
 
   // Fragments of the dataset.
+  //
+  // This should be ignored if the "external manifests" feature is active, in
+  // favor of the external manifests field.
   repeated DataFragment fragments = 2;
 
   // Snapshot version number.
@@ -81,6 +84,7 @@ message Manifest {
   //
   // Known flags:
   // * 1: deletion files are present
+  // * 2: external manifests are used.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -92,6 +96,16 @@ message Manifest {
   // The flags are the same as for reader_feature_flags, although they will not
   // always apply to both.
   uint64 writer_feature_flags = 10;
+
+  // Paths to external manifests
+  // 
+  // External manifests are Lance files that contain all metadata about the
+  // fragments. Each row represents a single fragment.
+  //
+  // The schema of the file includes:
+  // * fragment_id: u32
+
+  repeated string external_manifest_paths = 11;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -199,6 +213,12 @@ message Metadata {
   //   length = page_table[5][4][1];
   // ```
   uint64 page_table_position = 3;
+
+  // All fields in the statistics
+  repeated Field stats_fields = 4;
+
+	// The file position of the statistics page table
+	uint64 stats_page_table_position = 5;
 } // Metadata
 
 // Supported encodings.
