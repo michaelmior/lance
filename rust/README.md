@@ -26,7 +26,7 @@ Suppose `batches` is an Arrow `Vec<RecordBatch>` and schema is Arrow `SchemaRef`
 use lance::{dataset::WriteParams, Dataset};
 
 let write_params = WriteParams::default();
-let mut reader = RecordBatchIterator::new(
+let reader = RecordBatchIterator::new(
     batches.into_iter().map(Ok),
     schema
 );
