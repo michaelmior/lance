@@ -33,6 +33,7 @@ use object_store::path::Path;
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
+pub mod optimize;
 pub mod scanner;
 pub mod updater;
 mod write;
