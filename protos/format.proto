@@ -112,6 +112,13 @@ message Manifest {
   //   * read_version: u64
   //   * id: u64
   repeated string external_manifest_paths = 11;
+
+  // The field ids of the columns to collect statistics for.
+  //
+  // In future writes, statistics for other columns will be dropped and 
+  // statistics will only be collected for these columns going forward. If
+  // this field is empty, then statistics will be collected for all columns.
+  repeated uint32 statistics_columns = 12;
 } // Manifest
 
 // Auxiliary Data attached to a version.
