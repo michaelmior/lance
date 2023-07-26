@@ -13,6 +13,51 @@
 // limitations under the License.
 
 //! Table maintenance for optimizing table layout.
+//!
+//! As a table is updated, it's layout can become suboptimal. For example, if
+//! a series of small streaming appends are performed, eventually there will be
+//! a large number of small files. This imposes an overhead to track the large
+//! number of files and for very small files can make it harder to read data
+//! efficiently. In this case, files can be compacted into fewer larger files.
+//!
+//! To compact files in a table, use the [compact_files] method. This currently
+//! can compact in two cases:
+//!
+//! 1. If a fragment has fewer rows than the target number of rows per fragment.
+//! 2. If a fragment has a higher percentage of deleted rows than the provided
+//!    threshold.
+//!
+//! ```rust
+//! # use std::sync::Arc;
+//! # use tokio::runtime::Runtime;
+//! # use arrow_array::{RecordBatch, RecordBatchIterator, Int64Array};
+//! # use arrow_schema::{Schema, Field, DataType};
+//! use lance::{dataset::WriteParams, Dataset, dataset::optimize::compact_files};
+//!
+//! # let mut rt = Runtime::new().unwrap();
+//! # rt.block_on(async {
+//! #
+//! # let test_dir = tempfile::tempdir().unwrap();
+//! # let uri = test_dir.path().to_str().unwrap().to_string();
+//! let schema = Arc::new(Schema::new(vec![Field::new("test", DataType::Int64, false)]));
+//! let data = RecordBatch::try_new(
+//!     schema.clone(),
+//!     vec![Arc::new(Int64Array::from_iter_values(0..10_000))]
+//! ).unwrap();
+//! let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
+//!
+//! // Write 100 small files
+//! let write_params = WriteParams { max_rows_per_file: 100, ..Default::default()};
+//! let mut dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
+//! assert_eq!(dataset.get_fragments().len(), 100);
+//!
+//! // Use compact_files() to consolidate the data to 1 fragment
+//! let metrics = compact_files(&mut dataset, Default::default()).await.unwrap();
+//! assert_eq!(metrics.fragments_removed, 100);
+//! assert_eq!(metrics.fragments_added, 1);
+//! assert_eq!(dataset.get_fragments().len(), 1);
+//! # })
+//! ```
 
 use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
@@ -28,6 +73,7 @@ use crate::{format::Fragment, Dataset};
 use super::fragment::FileFragment;
 use super::{write_fragments, write_manifest_file, WriteMode, WriteParams};
 
+/// Options to be passed to [compact_files].
 #[derive(Debug, Clone)]
 pub struct CompactionOptions {
     /// Target number of rows per file. Defaults to 1 million.
@@ -35,22 +81,22 @@ pub struct CompactionOptions {
     /// This is used to determine which fragments need compaction, as any
     /// fragments that have fewer rows than this value will be candidates for
     /// compaction.
-    target_rows_per_fragment: usize,
+    pub target_rows_per_fragment: usize,
     /// Max number of rows per group
     ///
     /// This does not affect which fragments need compaction, but does affect
     /// how they are re-written if selected.
-    max_rows_per_group: usize,
+    pub max_rows_per_group: usize,
     /// Whether to compact fragments with deletions so there are no deletions.
     /// Defaults to true.
-    materialize_deletions: bool,
+    pub materialize_deletions: bool,
     /// The fraction of rows that need to be deleted in a fragment before
     /// materializing the deletions. Defaults to 10% (0.1). Setting to zero (or
     /// lower) will materialize deletions for all fragments with deletions.
     /// Setting above 1.0 will never materialize deletions.
-    materialize_deletion_threshold: f32,
+    pub materialize_deletion_threshold: f32,
     /// The number of concurrent jobs. Defaults to the number of CPUs.
-    num_concurrent_jobs: usize,
+    pub num_concurrent_jobs: usize,
 }
 
 impl Default for CompactionOptions {
@@ -75,12 +121,18 @@ impl CompactionOptions {
     }
 }
 
+/// Metrics returned by [compact_files].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactionMetrics {
-    fragments_removed: usize,
-    fragments_added: usize,
-    files_removed: usize,
-    files_added: usize,
+    /// The number of fragments that have been overwritten.
+    pub fragments_removed: usize,
+    /// The number of new fragments that have been added.
+    pub fragments_added: usize,
+    /// The number of files that have been removed, including deletion files.
+    pub files_removed: usize,
+    /// The number of files that have been added, which is always equal to the
+    /// number of fragments.
+    pub files_added: usize,
 }
 
 impl AddAssign for CompactionMetrics {
@@ -106,16 +158,10 @@ pub async fn compact_files(
     dataset: &mut Dataset,
     mut options: CompactionOptions,
 ) -> Result<CompactionMetrics> {
-    // First, validate the arguments.
     options.validate();
 
-    // Then, build a plan about which fragments to compact, and in what groups
     let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
 
-    // Finally, run a compaction job to compact the fragments. This works by:
-    // Scanning the fragments in each group, and writing the rows to a new file
-    // until we have reached the appropriate size. Then, we move to writing a new
-    // file.
     let mut metrics = CompactionMetrics::default();
 
     // If nothing to compact, don't make a commit.
@@ -123,26 +169,25 @@ pub async fn compact_files(
         return Ok(metrics);
     }
 
-    // Once all the files are written, we collect the metadata and commit.
     let mut result_stream = futures::stream::iter(compaction_plan.fragments_iter())
         .map(|task| rewrite_files(task, &options))
         .buffer_unordered(options.num_concurrent_jobs);
 
+    // Prepare this so we can assign ids to the new fragments.
     let mut current_fragment_id = dataset
         .manifest
         .max_fragment_id()
         .map(|max| max + 1)
         .unwrap_or(0);
 
-    // Mapping of replacement ranges to the new fragments
     let mut new_fragments: HashMap<Range<usize>, Vec<Fragment>> = HashMap::new();
 
     while let Some(result) = result_stream.next().await {
         let mut result = result?;
 
-        // Update the metrics
         metrics += result.metrics;
 
+        // Assign fragment ids
         for fragment in &mut result.new_fragments {
             fragment.id = current_fragment_id;
             current_fragment_id += 1;
@@ -186,7 +231,6 @@ pub async fn compact_files(
 
     dataset.manifest = Arc::new(manifest);
 
-    // Finally, we return the metrics.
     Ok(metrics)
 }
 
@@ -223,18 +267,27 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     })
 }
 
+/// A plan for what groups of fragments to compact. To preserve order, we only
+/// compact groups of fragments that are adjacent in the dataset. So each group
+/// to compact is represented as a range of indices in the `fragments` list. We
+/// also track the ranges of fragments that should be kept as-is, to make it
+/// easier to build the final list of fragments.
 struct CompactionPlan {
     pub fragments: Vec<FileFragment>,
     pub rewrite_groups: Vec<Range<usize>>,
     pub keep_groups: Vec<Range<usize>>,
 }
 
+/// A single group of fragments to compact, which is a view into the compaction
+/// plan. We keep the `replace_range` indices so we can map the result of the
+/// compact back to the fragments it replaces.
 struct CompactionTask<'a> {
     pub fragments: &'a [FileFragment],
     pub replace_range: Range<usize>,
 }
 
 impl CompactionPlan {
+    /// Iterate over the groups of fragments to compact
     fn fragments_iter(&self) -> impl Iterator<Item = CompactionTask> {
         self.rewrite_groups.iter().map(|range| CompactionTask {
             fragments: &self.fragments[range.clone()],
@@ -242,6 +295,10 @@ impl CompactionPlan {
         })
     }
 
+    /// Given the collection of new fragments written, build the list of fragments
+    /// for the final manifest. This preserves the order of the original fragments,
+    /// and inserts the new fragments in the same relative position as the
+    /// fragments they are replacing.
     fn build_fragment_list(
         &self,
         mut new_fragments: HashMap<Range<usize>, Vec<Fragment>>,
@@ -272,6 +329,7 @@ impl CompactionPlan {
     }
 }
 
+/// Builder for a compaction plan.
 struct CompactionPlanBuilder {
     fragments: Vec<FileFragment>,
     rewrite_groups: Vec<Range<usize>>,
@@ -280,36 +338,6 @@ struct CompactionPlanBuilder {
     current_group_size: usize,
     current_is_rewrite: bool,
     i: usize,
-}
-
-impl From<CompactionPlanBuilder> for CompactionPlan {
-    fn from(mut builder: CompactionPlanBuilder) -> Self {
-        // Finish last group
-        if builder.current_group_size > 0 {
-            if builder.current_is_rewrite && builder.current_group_size > 1 {
-                builder
-                    .rewrite_groups
-                    .push(builder.current_group_start..builder.fragments.len());
-            } else {
-                builder
-                    .keep_groups
-                    .push(builder.current_group_start..builder.fragments.len());
-            }
-        }
-
-        let CompactionPlanBuilder {
-            fragments,
-            rewrite_groups,
-            keep_groups,
-            ..
-        } = builder;
-
-        Self {
-            fragments,
-            rewrite_groups,
-            keep_groups,
-        }
-    }
 }
 
 impl CompactionPlanBuilder {
@@ -329,7 +357,13 @@ impl CompactionPlanBuilder {
         self.fragments.push(fragment);
 
         if self.current_is_rewrite != is_candidate {
+            // Any change in the candidate status of the fragment means we
+            // are switching groups.
             if self.current_group_size > 0 {
+                // Note: we don't compact single fragments, thus we only add
+                // to rewrite groups if there are at least 2 fragments in group.
+                // This might mean we will add length 1 groups to keep groups,
+                // but that's ok.
                 if self.current_is_rewrite && self.current_group_size > 1 {
                     self.rewrite_groups.push(self.current_group_start..self.i);
                 } else {
@@ -344,6 +378,32 @@ impl CompactionPlanBuilder {
         }
 
         self.i += 1;
+    }
+
+    fn build(mut self) -> CompactionPlan {
+        // Finish last group
+        if self.current_group_size > 0 {
+            if self.current_is_rewrite && self.current_group_size > 1 {
+                self.rewrite_groups
+                    .push(self.current_group_start..self.fragments.len());
+            } else {
+                self.keep_groups
+                    .push(self.current_group_start..self.fragments.len());
+            }
+        }
+
+        let CompactionPlanBuilder {
+            fragments,
+            rewrite_groups,
+            keep_groups,
+            ..
+        } = self;
+
+        CompactionPlan {
+            fragments,
+            rewrite_groups,
+            keep_groups,
+        }
     }
 }
 
@@ -381,7 +441,7 @@ async fn plan_compaction(dataset: &Dataset, options: &CompactionOptions) -> Resu
         }
     }
 
-    Ok(compaction_plan.into())
+    Ok(compaction_plan.build())
 }
 
 #[derive(Debug)]
