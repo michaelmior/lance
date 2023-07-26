@@ -667,6 +667,12 @@ impl Stream for DatasetRecordBatchStream {
     }
 }
 
+impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
+    fn from(stream: DatasetRecordBatchStream) -> Self {
+        stream.exec_node
+    }
+}
+
 #[cfg(test)]
 mod test {
 
