@@ -14,11 +14,12 @@
 
 //! Table maintenance for optimizing table layout.
 
+use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
 use datafusion::physical_plan::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 
 use crate::format::Manifest;
 use crate::Result;
@@ -99,7 +100,7 @@ impl AddAssign for CompactionMetrics {
 ///  * Merges fragments that are too small.
 ///
 /// This method tries to preserve the insertion order of rows in the dataset.
-/// 
+///
 /// If no compaction is needed, this method will not make a new version of the table.
 pub async fn compact_files(
     dataset: &mut Dataset,
@@ -109,7 +110,7 @@ pub async fn compact_files(
     options.validate();
 
     // Then, build a plan about which fragments to compact, and in what groups
-    let compaction_groups: Vec<Vec<FileFragment>> = plan_compaction(dataset, &options).await?;
+    let compaction_plan: CompactionPlan = plan_compaction(dataset, &options).await?;
 
     // Finally, run a compaction job to compact the fragments. This works by:
     // Scanning the fragments in each group, and writing the rows to a new file
@@ -118,55 +119,44 @@ pub async fn compact_files(
     let mut metrics = CompactionMetrics::default();
 
     // If nothing to compact, don't make a commit.
-    if compaction_groups.is_empty() {
+    if compaction_plan.rewrite_groups.is_empty() {
         return Ok(metrics);
     }
 
     // Once all the files are written, we collect the metadata and commit.
-    let mut result_stream = futures::stream::iter(compaction_groups)
-        .map(|group| rewrite_files(group, &options))
+    let mut result_stream = futures::stream::iter(compaction_plan.fragments_iter())
+        .map(|task| rewrite_files(task, &options))
         .buffer_unordered(options.num_concurrent_jobs);
 
-    let existing_fragments: Vec<Fragment> = dataset
-        .get_fragments()
-        .into_iter()
-        .map(|f| f.metadata)
-        .collect();
     let mut current_fragment_id = dataset
         .manifest
         .max_fragment_id()
         .map(|max| max + 1)
         .unwrap_or(0);
 
-    let mut final_fragments: Vec<Fragment> = Vec::new();
-    let mut existing_frag_i = 0;
+    // Mapping of replacement ranges to the new fragments
+    let mut new_fragments: HashMap<Range<usize>, Vec<Fragment>> = HashMap::new();
 
     while let Some(result) = result_stream.next().await {
-        let result = result?;
+        let mut result = result?;
 
         // Update the metrics
         metrics += result.metrics;
 
-        // We want to replace the old fragments with the new ones, but we we'd
-        // like to preserve the order.
-        for existing_fragment in existing_fragments[existing_frag_i..].iter() {
-            dbg!(existing_fragment.id, &result.replaced_fragment_ids);
-            if existing_fragment.id as u32 == *result.replaced_fragment_ids.first().unwrap() {
-                break;
-            }
-            
-            final_fragments.push(existing_fragment.clone());
-        }
-        // Skip the fragments we are replacing
-        existing_frag_i += result.replaced_fragment_ids.len();
-
-        // Add new fragments
-        for mut new_fragment in result.new_fragments {
-            new_fragment.id = current_fragment_id;
+        for fragment in &mut result.new_fragments {
+            fragment.id = current_fragment_id;
             current_fragment_id += 1;
-            final_fragments.push(new_fragment);
         }
+
+        let RewriteResult {
+            new_fragments: fragments,
+            replace_range,
+            ..
+        } = result;
+        new_fragments.insert(replace_range, fragments);
     }
+
+    let final_fragments = compaction_plan.build_fragment_list(new_fragments);
 
     // Commit the dataset transaction
     let indices = if metrics.fragments_removed == dataset.get_fragments().len() {
@@ -220,11 +210,6 @@ impl FragmentMetrics {
             0.0
         }
     }
-
-    /// The number of rows that are still in the fragment
-    fn num_rows(&self) -> usize {
-        self.fragment_length - self.num_deletions
-    }
 }
 
 async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
@@ -244,15 +229,130 @@ struct CompactionPlan {
     pub keep_groups: Vec<Range<usize>>,
 }
 
+struct CompactionTask<'a> {
+    pub fragments: &'a [FileFragment],
+    pub replace_range: Range<usize>,
+}
+
+impl CompactionPlan {
+    fn fragments_iter(&self) -> impl Iterator<Item = CompactionTask> {
+        self.rewrite_groups.iter().map(|range| CompactionTask {
+            fragments: &self.fragments[range.clone()],
+            replace_range: range.clone(),
+        })
+    }
+
+    fn build_fragment_list(
+        &self,
+        mut new_fragments: HashMap<Range<usize>, Vec<Fragment>>,
+    ) -> Vec<Fragment> {
+        let mut fragments = Vec::with_capacity(self.fragments.len());
+
+        let mut i = 0;
+        let mut rewrite_iter = self.rewrite_groups.iter().peekable();
+        let mut keep_iter = self.keep_groups.iter().peekable();
+
+        while i < self.fragments.len() {
+            if i == rewrite_iter.peek().map(|r| r.start).unwrap_or(usize::MAX) {
+                let range = rewrite_iter.next().unwrap();
+                fragments.extend(new_fragments.remove(range).unwrap());
+                i = range.end;
+            } else {
+                let range = keep_iter.next().unwrap();
+                fragments.extend(
+                    self.fragments[range.clone()]
+                        .iter()
+                        .map(|f| f.metadata.clone()),
+                );
+                i = range.end;
+            }
+        }
+
+        fragments
+    }
+}
+
+struct CompactionPlanBuilder {
+    fragments: Vec<FileFragment>,
+    rewrite_groups: Vec<Range<usize>>,
+    keep_groups: Vec<Range<usize>>,
+    current_group_start: usize,
+    current_group_size: usize,
+    current_is_rewrite: bool,
+    i: usize,
+}
+
+impl From<CompactionPlanBuilder> for CompactionPlan {
+    fn from(mut builder: CompactionPlanBuilder) -> Self {
+        // Finish last group
+        if builder.current_group_size > 0 {
+            if builder.current_is_rewrite && builder.current_group_size > 1 {
+                builder
+                    .rewrite_groups
+                    .push(builder.current_group_start..builder.fragments.len());
+            } else {
+                builder
+                    .keep_groups
+                    .push(builder.current_group_start..builder.fragments.len());
+            }
+        }
+
+        let CompactionPlanBuilder {
+            fragments,
+            rewrite_groups,
+            keep_groups,
+            ..
+        } = builder;
+
+        Self {
+            fragments,
+            rewrite_groups,
+            keep_groups,
+        }
+    }
+}
+
+impl CompactionPlanBuilder {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            fragments: Vec::with_capacity(n),
+            rewrite_groups: Vec::new(),
+            keep_groups: Vec::new(),
+            current_group_start: 0,
+            current_group_size: 0,
+            current_is_rewrite: false,
+            i: 0,
+        }
+    }
+
+    fn push(&mut self, fragment: FileFragment, is_candidate: bool) {
+        self.fragments.push(fragment);
+
+        if self.current_is_rewrite != is_candidate {
+            if self.current_group_size > 0 {
+                if self.current_is_rewrite && self.current_group_size > 1 {
+                    self.rewrite_groups.push(self.current_group_start..self.i);
+                } else {
+                    self.keep_groups.push(self.current_group_start..self.i);
+                }
+            }
+            self.current_group_start = self.i;
+            self.current_is_rewrite = is_candidate;
+            self.current_group_size = 1;
+        } else {
+            self.current_group_size += 1;
+        }
+
+        self.i += 1;
+    }
+}
+
 /// Formulate a plan to compact the files in a dataset
 ///
 /// Returns a list of groups of files that should be compacted together. The groups
 /// are separated and internally ordered such that they can preserve the existing
 /// order of the dataset.
-async fn plan_compaction(
-    dataset: &Dataset,
-    options: &CompactionOptions,
-) -> Result<Vec<Vec<FileFragment>>> {
+async fn plan_compaction(dataset: &Dataset, options: &CompactionOptions) -> Result<CompactionPlan> {
     // We assume here that get_fragments is returning the fragments in a
     // meaningful order that we want to preserve.
     let mut fragment_metrics = futures::stream::iter(dataset.get_fragments())
@@ -264,71 +364,50 @@ async fn plan_compaction(
         })
         .buffered(num_cpus::get() * 2);
 
-    let mut groups = Vec::new();
-    let mut current_group = Vec::new();
+    let mut compaction_plan = CompactionPlanBuilder::with_capacity(fragment_metrics.size_hint().0);
 
     while let Some(res) = fragment_metrics.next().await {
         let (fragment, metrics) = res?;
 
-        // If the fragment is too small, add it to the current group.
+        // If either the fragment is too small or has too many deletions, we
+        // consider it a candidate for compaction.
         if metrics.fragment_length < options.target_rows_per_fragment
             || (options.materialize_deletions
                 && metrics.deletion_percentage() > options.materialize_deletion_threshold)
         {
-            dbg!("Adding fragment to group", fragment.id(), metrics.num_rows(), metrics.deletion_percentage());
-            // If the fragment has deletions, and we are materializing deletions,
-            // add it to the current group.
-            current_group.push(fragment);
+            compaction_plan.push(fragment, true);
         } else {
-            dbg!("skipping fragment", fragment.id());
-            // Otherwise, add the current group to the list of groups, and start
-            // a new group with this fragment.
-            if !current_group.is_empty() {
-                groups.push(std::mem::take(&mut current_group));
-            }
+            compaction_plan.push(fragment, false);
         }
     }
-    
-    // Add final group
-    groups.push(current_group);
 
-    // Cleanup: remove any lone files we don't have reason to compact.
-    let mut to_drop = Vec::new();
-    for (i, group) in groups.iter().enumerate() {
-        if group.len() == 1 && group[0].metadata.deletion_file.is_none() {
-            to_drop.push(i);
-        }
-    }
-    for i in to_drop {
-        groups.remove(i);
-    }
-
-    Ok(groups)
+    Ok(compaction_plan.into())
 }
 
 #[derive(Debug)]
 struct RewriteResult {
     metrics: CompactionMetrics,
     new_fragments: Vec<Fragment>,
-    replaced_fragment_ids: Vec<u32>,
+    replace_range: Range<usize>,
 }
 
 async fn rewrite_files(
-    group: Vec<FileFragment>,
+    task: CompactionTask<'_>,
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
 
-    if group.is_empty() {
+    if task.fragments.is_empty() {
         return Ok(RewriteResult {
             metrics,
             new_fragments: Vec::new(),
-            replaced_fragment_ids: Vec::new(),
+            replace_range: task.replace_range,
         });
     }
 
-    let dataset = group[0].dataset();
-    let fragments = group
+    let dataset = task.fragments[0].dataset();
+    let fragments = task
+        .fragments
         .iter()
         .map(|fragment| fragment.metadata.clone())
         .collect();
@@ -352,11 +431,12 @@ async fn rewrite_files(
     )
     .await?;
 
-    metrics.files_removed = group
+    metrics.files_removed = task
+        .fragments
         .iter()
         .map(|f| f.metadata.files.len() + f.metadata.deletion_file.is_some() as usize)
         .sum();
-    metrics.fragments_removed = group.len();
+    metrics.fragments_removed = task.fragments.len();
     metrics.fragments_added = new_fragments.len();
     metrics.files_added = new_fragments
         .iter()
@@ -366,14 +446,17 @@ async fn rewrite_files(
     Ok(RewriteResult {
         metrics,
         new_fragments,
-        replaced_fragment_ids: group.iter().map(|f| f.id() as u32).collect(),
+        replace_range: task.replace_range,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+
+    use arrow_array::{Float32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
+    use arrow_select::concat::concat_batches;
+    use futures::TryStreamExt;
     use tempfile::tempdir;
 
     use super::*;
@@ -402,7 +485,7 @@ mod tests {
         let plan = plan_compaction(&dataset, &CompactionOptions::default())
             .await
             .unwrap();
-        assert_eq!(plan.len(), 0);
+        assert_eq!(plan.rewrite_groups.len(), 0);
 
         let metrics = compact_files(&mut dataset, CompactionOptions::default())
             .await
@@ -419,7 +502,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let data = sample_data();
-        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone());
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
         // Just one file
         let write_params = WriteParams {
             max_rows_per_file: 10_000,
@@ -433,10 +516,10 @@ mod tests {
         let plan = plan_compaction(&dataset, &CompactionOptions::default())
             .await
             .unwrap();
-        assert_eq!(plan.len(), 0);
+        assert_eq!(plan.rewrite_groups.len(), 0);
 
         // Now split across multiple files
-        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone());
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 3_000,
             max_rows_per_group: 1_000,
@@ -452,7 +535,7 @@ mod tests {
             ..Default::default()
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
-        assert_eq!(plan.len(), 0);
+        assert_eq!(plan.rewrite_groups.len(), 0);
     }
 
     #[tokio::test]
@@ -461,10 +544,9 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let data = sample_data();
-        
+
         // Create a table with 3 small fragments
-        let reader = RecordBatchIterator::new(vec![
-            Ok(data.slice(0, 1200))], data.schema().clone());
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 1200))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 400,
             ..Default::default()
@@ -474,7 +556,7 @@ mod tests {
             .unwrap();
 
         // Append 2 large fragments (1k rows)
-        let reader = RecordBatchIterator::new(vec![Ok(data.slice(1200, 2000))], data.schema().clone());
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(1200, 2000))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 1000,
             mode: WriteMode::Append,
@@ -491,7 +573,7 @@ mod tests {
         dataset.delete("a >= 2400 AND a < 2600").await.unwrap();
 
         // Append 2 small fragments
-        let reader = RecordBatchIterator::new(vec![Ok(data.slice(3200, 600))], data.schema().clone());
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(3200, 600))], data.schema());
         let write_params = WriteParams {
             max_rows_per_file: 300,
             mode: WriteMode::Append,
@@ -506,20 +588,16 @@ mod tests {
             target_rows_per_fragment: 1000,
             ..Default::default()
         };
-        let plan = plan_compaction(&dataset, &options)
-            .await
-            .unwrap();
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].len(), 3);
-        assert_eq!(plan[1].len(), 3);
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.rewrite_groups.len(), 2);
+        assert_eq!(plan.rewrite_groups[0].len(), 3);
+        assert_eq!(plan.rewrite_groups[1].len(), 3);
 
-        assert_eq!(plan[0].iter().map(|f| f.id()).collect::<Vec<_>>(), vec![0, 1, 2]);
-        assert_eq!(plan[1].iter().map(|f| f.id()).collect::<Vec<_>>(), vec![4, 5, 6]);
+        assert_eq!(plan.rewrite_groups[0], 0..3);
+        assert_eq!(plan.rewrite_groups[1], 4..7);
 
         // Run compaction
-        let metrics = compact_files(&mut dataset, options)
-            .await
-            .unwrap();
+        let metrics = compact_files(&mut dataset, options).await.unwrap();
 
         // Assert on metrics
         assert_eq!(metrics.fragments_removed, 6);
@@ -527,24 +605,84 @@ mod tests {
         assert_eq!(metrics.files_removed, 7); // 6 data files + 1 deletion file
         assert_eq!(metrics.files_added, 4);
 
-        let fragment_ids = dataset.get_fragments().iter().map(|f| f.id()).collect::<Vec<_>>();
-        assert_eq!(fragment_ids, vec![7, 8, 3, 9, 10]);
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id())
+            .collect::<Vec<_>>();
+        // Fragment ids are assigned on task completion, but that isn't deterministic.
+        // But we can say the old fragment id=3 should be in the middle, and all
+        // the other ids should be greater than 6.
+        assert_eq!(fragment_ids[2], 3);
+        assert!(fragment_ids.iter().all(|id| *id > 6 || *id == 3));
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_compact_data_files() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = sample_data();
+
         // Create a table with 2 small fragments
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        // Just one file
+        let write_params = WriteParams {
+            max_rows_per_file: 5_000,
+            max_rows_per_group: 1_000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
 
         // Add a column
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("x", DataType::Float32, false),
+        ]);
 
-        // Create compaction plan
-        // Assert both files compacted
+        let data = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..10_000)),
+                Arc::new(Float32Array::from_iter_values(
+                    (0..10_000).map(|x| x as f32 * std::f32::consts::PI),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
-        // Run compaction
+        dataset.merge(reader, "a", "a").await.unwrap();
 
-        // Assert files reduced to 1 per fragment
-        // assert just one fragment
+        let plan = plan_compaction(&dataset, &CompactionOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(plan.rewrite_groups.len(), 1);
+        assert_eq!(plan.rewrite_groups[0].len(), 2);
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(metrics.files_removed, 4); // 2 fragments with 2 data files
+        assert_eq!(metrics.files_added, 1); // 1 fragment with 1 data file
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
 
         // Assert order unchanged and data is all there.
+        let scanner = dataset.scan();
+        let batches = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let scanned_data = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        assert_eq!(scanned_data, data);
     }
 }
