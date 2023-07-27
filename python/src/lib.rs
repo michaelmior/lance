@@ -21,9 +21,9 @@
 use std::env;
 
 use ::arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use dataset::optimize::PyCompactionMetrics;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_schema::Schema;
+use dataset::optimize::PyCompactionMetrics;
 use env_logger::Env;
 use pyo3::prelude::*;
 

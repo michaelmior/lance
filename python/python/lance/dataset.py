@@ -28,9 +28,9 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .fragment import LanceFragment
+from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _compact_files, _Dataset, _Scanner, _write_dataset
-from .lance import CompactionMetrics as CompactionMetrics
 
 try:
     import pandas as pd
@@ -968,7 +968,7 @@ class DatasetOptimizer:
         num_concurrent_jobs: int, optional
             The number of concurrent jobs to use for compaction. If not
             specified, defaults to the number of cores on the machine.
-        
+
         Returns
         -------
         CompactionMetrics
