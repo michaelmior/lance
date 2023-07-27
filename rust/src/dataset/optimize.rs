@@ -359,10 +359,6 @@ enum CompactionCandidacy {
 }
 
 /// Formulate a plan to compact the files in a dataset
-///
-/// Returns a list of groups of files that should be compacted together. The groups
-/// are separated and internally ordered such that they can preserve the existing
-/// order of the dataset.
 async fn plan_compaction(dataset: &Dataset, options: &CompactionOptions) -> Result<CompactionPlan> {
     // We assume here that get_fragments is returning the fragments in a
     // meaningful order that we want to preserve.
