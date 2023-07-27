@@ -562,3 +562,83 @@ pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>
     };
     Ok(params)
 }
+
+pub mod optimize {
+    use lance::dataset::optimize::{compact_files, CompactionMetrics, CompactionOptions};
+    use pyo3::FromPyObject;
+
+    use super::*;
+
+    #[derive(FromPyObject)]
+    pub struct PyCompactionOptions {
+        #[pyo3(item)]
+        pub target_rows_per_fragment: usize,
+        #[pyo3(item)]
+        pub max_rows_per_group: usize,
+        #[pyo3(item)]
+        pub materialize_deletions: bool,
+        #[pyo3(item)]
+        pub materialize_deletions_threshold: f32,
+        #[pyo3(item)]
+        pub num_concurrent_jobs: Option<usize>,
+    }
+
+    impl From<PyCompactionOptions> for CompactionOptions {
+        fn from(py: PyCompactionOptions) -> Self {
+            let mut opts = Self {
+                target_rows_per_fragment: py.target_rows_per_fragment,
+                max_rows_per_group: py.max_rows_per_group,
+                materialize_deletions: py.materialize_deletions,
+                materialize_deletions_threshold: py.materialize_deletions_threshold,
+                ..Default::default()
+            };
+            if let Some(num_jobs) = py.num_concurrent_jobs {
+                opts.num_concurrent_jobs = num_jobs;
+            }
+            opts
+        }
+    }
+
+    #[pyclass(name = "CompactionMetrics", module = "lance")]
+    pub struct PyCompactionMetrics {
+        /// The number of fragments that have been overwritten.
+        #[pyo3(get)]
+        pub fragments_removed: usize,
+        /// The number of new fragments that have been added.
+        #[pyo3(get)]
+        pub fragments_added: usize,
+        /// The number of files that have been removed, including deletion files.
+        #[pyo3(get)]
+        pub files_removed: usize,
+        /// The number of files that have been added, which is always equal to the
+        /// number of fragments.
+        #[pyo3(get)]
+        pub files_added: usize,
+    }
+
+    impl From<CompactionMetrics> for PyCompactionMetrics {
+        fn from(metrics: CompactionMetrics) -> Self {
+            Self {
+                fragments_removed: metrics.fragments_removed,
+                fragments_added: metrics.fragments_added,
+                files_removed: metrics.files_removed,
+                files_added: metrics.files_added,
+            }
+        }
+    }
+
+    #[pyfunction(name = "_compact_files")]
+    pub fn py_compact_files(
+        dataset: &mut Dataset,
+        options: PyCompactionOptions,
+    ) -> PyResult<PyCompactionMetrics> {
+        let opts: CompactionOptions = options.into();
+        let mut new_ds = dataset.ds.as_ref().clone();
+        let fut = compact_files(&mut new_ds, opts);
+        let metrics = dataset.rt.block_on(async move {
+            fut.await.map_err(|err| PyIOError::new_err(err.to_string()))
+        })?;
+        dataset.ds = Arc::new(new_ds);
+        Ok(metrics.into())
+    }
+}

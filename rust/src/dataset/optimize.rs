@@ -94,7 +94,7 @@ pub struct CompactionOptions {
     /// materializing the deletions. Defaults to 10% (0.1). Setting to zero (or
     /// lower) will materialize deletions for all fragments with deletions.
     /// Setting above 1.0 will never materialize deletions.
-    pub materialize_deletion_threshold: f32,
+    pub materialize_deletions_threshold: f32,
     /// The number of concurrent jobs. Defaults to the number of CPUs.
     pub num_concurrent_jobs: usize,
 }
@@ -106,7 +106,7 @@ impl Default for CompactionOptions {
             target_rows_per_fragment: 1024 * 1024,
             max_rows_per_group: 1024,
             materialize_deletions: true,
-            materialize_deletion_threshold: 0.1,
+            materialize_deletions_threshold: 0.1,
             num_concurrent_jobs: num_cpus::get(),
         }
     }
@@ -115,7 +115,7 @@ impl Default for CompactionOptions {
 impl CompactionOptions {
     pub fn validate(&mut self) {
         // If threshold is 100%, same as turning off deletion materialization.
-        if self.materialize_deletions && self.materialize_deletion_threshold > 1.0 {
+        if self.materialize_deletions && self.materialize_deletions_threshold > 1.0 {
             self.materialize_deletions = false;
         }
     }
@@ -148,7 +148,7 @@ impl AddAssign for CompactionMetrics {
 ///
 /// This does a few things:
 ///  * Removes deleted rows from fragments.
-///  * Removed dropped columns from fragments.
+///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
 ///
 /// This method tries to preserve the insertion order of rows in the dataset.
@@ -433,7 +433,7 @@ async fn plan_compaction(dataset: &Dataset, options: &CompactionOptions) -> Resu
         // consider it a candidate for compaction.
         if metrics.fragment_length < options.target_rows_per_fragment
             || (options.materialize_deletions
-                && metrics.deletion_percentage() > options.materialize_deletion_threshold)
+                && metrics.deletion_percentage() > options.materialize_deletions_threshold)
         {
             compaction_plan.push(fragment, true);
         } else {
@@ -745,4 +745,6 @@ mod tests {
 
         assert_eq!(scanned_data, data);
     }
+
+    // Add a test: rewrite files with deletions even if they are just a single fragment.
 }

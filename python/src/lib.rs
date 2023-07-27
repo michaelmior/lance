@@ -21,6 +21,7 @@
 use std::env;
 
 use ::arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use dataset::optimize::PyCompactionMetrics;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_schema::Schema;
 use env_logger::Env;
@@ -35,6 +36,7 @@ pub(crate) mod scanner;
 pub(crate) mod updater;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
+use crate::dataset::optimize::py_compact_files;
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
 pub use fragment::FragmentMetadata;
@@ -55,8 +57,10 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
+    m.add_class::<PyCompactionMetrics>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(py_compact_files))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

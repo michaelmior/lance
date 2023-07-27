@@ -526,3 +526,22 @@ def test_scanner_schemas(tmp_path: Path):
     scanner = dataset.scanner(columns=["a"])
     assert scanner.dataset_schema == dataset.schema
     assert scanner.projected_schema == pa.schema([pa.field("a", pa.int64())])
+
+
+def test_dataset_optimize(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"a": range(1000), "b": range(1000)})
+
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=100)
+    assert len(dataset.get_fragments()) == 10
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=1000,
+        materialize_deletions=False,
+        num_concurrent_jobs=1,
+    )
+
+    assert metrics.fragments_removed == 10
+    assert metrics.fragments_added == 1
+    assert metrics.files_removed == 10
+    assert metrics.files_added == 1
